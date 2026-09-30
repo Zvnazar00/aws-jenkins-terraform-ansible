@@ -1,0 +1,11 @@
+#cloud-config
+users:
+  - default
+  - name: ubuntu
+    ssh_authorized_keys:
+      - "${public_key}"
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+
+package_update: true
+package_upgrade: true

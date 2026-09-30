@@ -1,0 +1,190 @@
+---
+# Play 1: Jenkins master (public subnet): Install Jenkins + Nginx proxy and create SSH key for agent
+- name: Configure Jenkins master
+  hosts: jenkins_master
+  become: true
+  gather_facts: true
+
+  vars:
+    jenkins_key_dir: /var/lib/jenkins/.ssh
+
+  tasks:
+    - name: Install base packages (Java, nginx, curl, gpg)
+      ansible.builtin.apt:
+        name:
+          - openjdk-17-jre
+          - nginx
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: true
+
+    - name: Add Jenkins repo key
+      ansible.builtin.get_url:
+        url: https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+        dest: /usr/share/keyrings/jenkins-keyring.asc
+        mode: "0644"
+
+    - name: Add Jenkins apt repo
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/jenkins.list
+        mode: "0644"
+        content: "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/\n"
+
+    - name: Install Jenkins
+      ansible.builtin.apt:
+        name: jenkins
+        state: present
+        update_cache: true
+
+    - name: Ensure Jenkins is started and enabled
+      ansible.builtin.systemd:
+        name: jenkins
+        state: started
+        enabled: true
+
+    - name: Deploy nginx reverse-proxy for Jenkins
+      ansible.builtin.copy:
+        src: files/nginx/jenkins.conf
+        dest: /etc/nginx/sites-available/jenkins.conf
+        mode: "0644"
+
+    - name: Enable Jenkins site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/jenkins.conf
+        dest: /etc/nginx/sites-enabled/jenkins.conf
+        state: link
+        notify: Reload nginx                 
+
+    - name: Remove default nginx site if exists
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Reload nginx
+
+    - name: Wait for Jenkins to write initial password
+      ansible.builtin.wait_for:
+        path: /var/lib/jenkins/secrets/initialAdminPassword
+        timeout: 300
+
+    - name: Read initial admin password
+      ansible.builtin.slurp:
+        src: /var/lib/jenkins/secrets/initialAdminPassword
+      register: jenkins_pwd
+
+    - name: Show Jenkins unlock password and URL
+      ansible.builtin.debug:
+        msg: "Unlock Jenkins at http://{{ inventory_hostname }}/ ; initial password: {{ jenkins_pwd.content | b64decode | trim }}"
+
+    - name: Ensure Jenkins SSH dir exists
+      ansible.builtin.file:
+        path: "{{ jenkins_key_dir }}"
+        state: directory
+        owner: jenkins
+        group: jenkins
+        mode: "0700"
+
+    - name: Generate SSH keypair for Jenkins (idempotent)
+      ansible.builtin.command:
+        cmd: "ssh-keygen -t ed25519 -N '' -f {{ jenkins_key_dir }}/id_ed25519"
+      args:
+        creates: "{{ jenkins_key_dir }}/id_ed25519"
+      become_user: jenkins
+
+    - name: Read Jenkins public key
+      ansible.builtin.slurp:
+        src: "{{ jenkins_key_dir }}/id_ed25519.pub"
+      register: jenkins_pub
+
+    - name: Set fact with Jenkins public key for worker
+      ansible.builtin.set_fact:
+        jenkins_public_key: "{{ jenkins_pub.content | b64decode | trim }}"
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+
+
+
+# Play 2: Worker (private subnet): Install Java + Docker (from Docker repo) and authorize Jenkins key
+- name: Prepare Jenkins worker
+  hosts: jenkins_worker
+  become: true
+  gather_facts: true
+
+  vars:
+    jenkins_pubkey: "{{ hostvars[groups['jenkins_master'][0]].jenkins_public_key }}"
+
+  tasks:
+    - name: Install base packages
+      ansible.builtin.apt:
+        name:
+          - openjdk-17-jre
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: true
+
+    - name: Ensure /etc/apt/keyrings exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Fetch Docker GPG key (ASCII)
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Convert Docker key to binary gpg
+      ansible.builtin.command:
+        cmd: gpg --dearmor -o /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/docker.asc
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Add Docker apt repo (amd64)
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release | lower }} stable"
+        filename: docker
+        state: present
+        update_cache: true
+
+    - name: Install Docker CE + Compose v2
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Enable and start Docker
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Add ubuntu to docker group
+      ansible.builtin.user:
+        name: ubuntu
+        groups: docker
+        append: true
+
+    - name: Authorize Jenkins master SSH public key for ubuntu
+      ansible.builtin.authorized_key:
+        user: ubuntu
+        key: "{{ jenkins_pubkey }}"
+        state: present
+
+    - name: Print worker ready message
+      ansible.builtin.debug:
+        msg: "Worker ready. Jenkins can SSH to {{ inventory_hostname }} via key from master."
+                                                                                                                                                                                      

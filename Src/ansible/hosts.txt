@@ -1,0 +1,5 @@
+[jenkins_master]
+<MASTER_PUBLIC_IP>
+
+[jenkins_worker]
+<WORKER_PRIVATE_IP> ansible_ssh_common_args='-o ProxyJump=ubuntu@<MASTER_PUBLIC_IP>'
